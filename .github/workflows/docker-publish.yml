@@ -1,49 +1,28 @@
-name: Build and Push Multi-Arch Docker Image
+name: Build and Push Docker Image
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - 'main'
+      - main
   schedule:
     - cron: "0 2 */7 * *"
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  build-per-arch:
-    name: Build on ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-
-    permissions:
-      contents: read
-      packages: write
+  build-and-push:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Generate Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=-${{ matrix.arch }}
-            latest=false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to the GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -51,41 +30,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push arch-specific image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  publish-manifest:
-    name: Publish 'latest' manifest
-    needs: build-per-arch
-    runs-on: ubuntu-latest
-
-    permissions:
-      packages: write
-
-    steps:
-      - name: Log in to the GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push 'latest' manifest
+      - name: Compute lowercased image name
+        shell: bash
         run: |
-          # On convertit le nom de l'image en minuscules avant de l'utiliser
-          LOWERCASE_IMAGE_NAME=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "Will push to: ${IMAGE}:latest"
 
-          echo "Creating manifest for ${LOWERCASE_IMAGE_NAME}:latest..."
-          docker manifest create ${LOWERCASE_IMAGE_NAME}:latest \
-            --amend ${LOWERCASE_IMAGE_NAME}:latest-amd64
-
-          docker manifest push ${LOWERCASE_IMAGE_NAME}:latest
+      - name: Build and push :latest
+        shell: bash
+        run: |
+          docker build -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:latest"
