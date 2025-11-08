@@ -10,7 +10,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # On garde le nom de l'image avec sa casse d'origine ici
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -24,9 +23,6 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm64
 
     permissions:
       contents: read
@@ -36,15 +32,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # NOUVELLE ÉTAPE : Génère les tags et labels en minuscules
       - name: Generate Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # Spécifie le nom de l'image. L'action se chargera de le mettre en minuscules.
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # On crée un tag qui se termine par '-<architecture>'
-          # ex: 'latest-amd64'
           flavor: |
             suffix=-${{ matrix.arch }}
             latest=false
@@ -66,7 +58,6 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          # On utilise les tags générés par l'étape 'meta', qui sont garantis en minuscules
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -88,16 +79,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ÉTAPE MODIFIÉE : Crée le manifest en utilisant un nom d'image en minuscules
       - name: Create and push 'latest' manifest
         run: |
           # On convertit le nom de l'image en minuscules avant de l'utiliser
           LOWERCASE_IMAGE_NAME=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          
-          echo "Creating manifest for ${LOWERCASE_IMAGE_NAME}:latest..."
 
+          echo "Creating manifest for ${LOWERCASE_IMAGE_NAME}:latest..."
           docker manifest create ${LOWERCASE_IMAGE_NAME}:latest \
-            --amend ${LOWERCASE_IMAGE_NAME}:latest-amd64 \
-            --amend ${LOWERCASE_IMAGE_NAME}:latest-arm64
-            
+            --amend ${LOWERCASE_IMAGE_NAME}:latest-amd64
+
           docker manifest push ${LOWERCASE_IMAGE_NAME}:latest
