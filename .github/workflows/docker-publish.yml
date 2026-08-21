@@ -5,20 +5,51 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "**/*.md"
+      - LICENSE
   schedule:
-    - cron: "0 2 */7 * *"
+    # Daily. Also picks up new ubuntu:26.04 base digests (security updates),
+    # which invalidate the build cache on their own.
+    - cron: "17 3 * * *"
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPO: https://github.com/tdlib/telegram-bot-api.git
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Resolve upstream revision
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      short: ${{ steps.upstream.outputs.short }}
+      package: ${{ steps.upstream.outputs.package }}
+    steps:
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "$UPSTREAM_REPO" HEAD | cut -f1)"
+          [ -n "$sha" ] || { echo "::error::could not resolve upstream HEAD"; exit 1; }
+          echo "sha=$sha"                             >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}"                    >> "$GITHUB_OUTPUT"
+          echo "package=${GITHUB_REPOSITORY##*/}"     >> "$GITHUB_OUTPUT"
+          echo "Upstream telegram-bot-api: $sha" >> "$GITHUB_STEP_SUMMARY"
+
   build:
-    name: Build on ${{ matrix.platform }}
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +65,7 @@ jobs:
       - name: Prepare platform pair
         run: |
           platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -49,7 +80,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract labels for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -61,13 +92,22 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          build-args: |
+            TELEGRAM_BOT_API_REF=${{ needs.prepare.outputs.sha }}
+            TELEGRAM_BOT_API_REPO=${{ env.UPSTREAM_REPO }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            io.tdlib.telegram-bot-api.revision=${{ needs.prepare.outputs.sha }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-platform scope, otherwise the two matrix jobs evict each other.
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,scope=${{ env.PLATFORM_PAIR }},mode=max
 
       - name: Export digest
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
@@ -82,8 +122,12 @@ jobs:
 
   merge:
     name: Create multi-arch manifest
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    needs: build
+    permissions:
+      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
 
     steps:
       - name: Download digests
@@ -108,16 +152,106 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tags are stable across daily rebuilds: a rebuild of an unchanged
+          # upstream reuses the same tag instead of adding a new one, so the
+          # tag list cannot grow one entry per run.
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=long
+            type=raw,value=upstream-${{ needs.prepare.outputs.short }},enable={{is_default_branch}}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          set -euo pipefail
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: Prune old GHCR images
+    needs: [prepare, merge]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      # Manifest-list aware: untagged platform children still referenced by a
+      # kept tag are never deleted. `validate` re-checks that after pruning.
+      - name: Delete stale package versions
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ needs.prepare.outputs.package }}
+          delete-untagged: true
+          delete-partial-images: true
+          delete-ghost-images: true
+          keep-n-tagged: 5
+          exclude-tags: latest
+          validate: true
+
+  keepalive:
+    name: Keep the schedule alive
+    needs: [prepare, merge]
+    # Runs even when the build fails: the point is repository activity.
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Force-push a single-commit keepalive branch
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_RESULT: ${{ needs.merge.result }}
+        run: |
+          set -euo pipefail
+          ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cat > /tmp/STATUS.md <<EOF
+          # CI keepalive
+
+          Disposable branch written by \`.github/workflows/docker-publish.yml\`.
+          It always holds exactly **one** commit: every run rewrites it with
+          \`git push --force\`, so this activity never accumulates history.
+
+          Its only job is to register repository activity so GitHub does not
+          disable the daily scheduled build after 60 days of inactivity.
+
+          | | |
+          |---|---|
+          | Last run | ${ts} |
+          | Trigger | ${GITHUB_EVENT_NAME} |
+          | Workflow run | ${run_url} |
+          | Upstream telegram-bot-api | ${UPSTREAM_SHA} |
+          | Image build | ${BUILD_RESULT} |
+          EOF
+
+          # Plumbing only: commit-tree without -p yields a parentless commit,
+          # so the branch is reset rather than extended.
+          blob="$(git hash-object -w /tmp/STATUS.md)"
+          tree="$(printf '100644 blob %s\tSTATUS.md\n' "$blob" | git mktree)"
+          commit="$(git commit-tree "$tree" -m "chore(ci): keepalive ${ts}")"
+          git push --force origin "${commit}:refs/heads/ci-keepalive"
+
+      - name: Re-enable the schedule if GitHub disabled it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/docker-publish.yml/enable" \
+            --silent || echo "::warning::could not re-enable the workflow"

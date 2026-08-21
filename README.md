@@ -1,6 +1,6 @@
 # tdlib-telegram-bot-api-docker
 
-Image Docker minimale et sécurisée qui compile et embarque le serveur Telegram Bot API (projet officiel tdlib/telegram-bot-api) à partir des sources. L’image utilise une construction multi‑étapes sur Ubuntu 24.04, s’exécute en utilisateur non‑root, persiste les données dans /data, expose le port 8081 et démarre en mode `--local` par défaut.
+Image Docker minimale et sécurisée qui compile et embarque le serveur Telegram Bot API (projet officiel tdlib/telegram-bot-api) à partir des sources. L’image suit les instructions de build officielles amont (Ubuntu 26.04 LTS, clang/libc++), utilise une construction multi‑étapes, s’exécute en utilisateur non‑root, persiste les données dans /data, expose le port 8081 et démarre en mode `--local` par défaut.
 
 ## Sommaire
 - Présentation
@@ -11,6 +11,7 @@ Image Docker minimale et sécurisée qui compile et embarque le serveur Telegram
 - Configuration utile (flags)
 - Monter de version / mise à jour
 - Construction locale (build)
+- Intégration continue & rétention GHCR
 - Dépannage
 
 ---
@@ -18,12 +19,21 @@ Image Docker minimale et sécurisée qui compile et embarque le serveur Telegram
 ## Présentation
 Cette image empaquette le binaire `telegram-bot-api` compilé depuis le dépôt amont. Elle est poussée sur GHCR sous:
 
-- ghcr.io/tbringuier/tdlib-telegram-bot-api-docker:latest
+- `ghcr.io/tbringuier/tdlib-telegram-bot-api-docker:latest` — dernière build
+- `ghcr.io/tbringuier/tdlib-telegram-bot-api-docker:upstream-<sha12>` — révision amont précise
 
 Caractéristiques:
 - Non‑root (UID 10001), volume persistant `/data`
 - Port exposé: 8081 (HTTP)
 - Démarrage par défaut: `telegram-bot-api --local --dir=/data`
+- Multi‑arch: `linux/amd64` et `linux/arm64`
+- Compilé selon la [doc officielle](https://tdlib.github.io/telegram-bot-api/build.html):
+  Ubuntu 26.04 LTS, `clang-21` + `libc++`, `CMAKE_BUILD_TYPE=Release`,
+  installation dans `/usr/local`
+- Runtime minimal: seuls `ca-certificates` et `tzdata` sont ajoutés à `ubuntu:26.04`.
+  `libc++` est lié **statiquement** et OpenSSL/zlib/libgcc sont déjà dans l'image de
+  base, donc aucun runtime C++ à embarquer. Binaire *stripped*
+- Healthcheck sans dépendance externe (sonde TCP via bash, pas de `curl` embarqué)
 
 ## Prérequis
 Le serveur Bot API nécessite un `api_id` et un `api_hash` obtenus sur le portail officiel Telegram:
@@ -137,6 +147,50 @@ Construire localement:
 ```bash
 docker build -t tdlib-telegram-bot-api-docker:local .
 ```
+
+Épingler une révision amont précise (`TELEGRAM_BOT_API_REF` accepte une branche,
+un tag **ou** un SHA complet):
+```bash
+docker build \
+  --build-arg TELEGRAM_BOT_API_REF=adfd7f6a8e990272851777eeb3ae0def4216f161 \
+  -t tdlib-telegram-bot-api-docker:local .
+```
+
+La révision amont réellement utilisée est conservée dans l'image:
+```bash
+docker run --rm --entrypoint cat tdlib-telegram-bot-api-docker:local \
+  /usr/local/share/telegram-bot-api.commit
+```
+
+## Intégration continue & rétention GHCR
+Le workflow `.github/workflows/docker-publish.yml` tourne **tous les jours** (03:17 UTC),
+à chaque push sur `main` (hors fichiers Markdown) et à la demande.
+
+- **Révision amont épinglée**: le SHA de `tdlib/telegram-bot-api` est résolu en amont
+  du build, puis passé en `--build-arg`. Les builds sont donc reproductibles et le
+  cache n'est invalidé que lorsque l'amont bouge réellement.
+- **Cache**: cache GitHub Actions par plateforme (`scope=linux-amd64` / `linux-arm64`),
+  sinon les deux jobs de la matrice s'évincent mutuellement. Chaque plateforme est
+  construite nativement (pas de QEMU).
+- **Mises à jour de sécurité**: une nouvelle image `ubuntu:26.04` change son digest,
+  ce qui invalide le cache et déclenche une reconstruction complète automatiquement.
+- **Tags stables**: une reconstruction d'un amont inchangé réutilise le même tag.
+  Aucun tag n'est créé par run, donc pas d'accumulation.
+- **Rétention GHCR**: le job `cleanup` supprime les versions non taguées, partielles
+  ou fantômes et ne garde que les 5 tags les plus récents (`latest` est toujours
+  préservé). L'action utilisée est consciente des *manifest lists*: les manifestes
+  par plateforme référencés par un tag conservé ne sont jamais supprimés, et
+  l'option `validate` revérifie l'intégrité multi‑arch après le ménage.
+- **Anti‑désactivation du cron**: GitHub désactive les workflows planifiés après
+  60 jours sans activité. Le job `keepalive` génère donc de l'activité à chaque run
+  en *force‑pushant* la branche `ci-keepalive`, qui ne contient **jamais plus d'un
+  commit** (commit orphelin recréé à chaque fois, l'historique est écrasé et non
+  allongé). Cette branche est jetable: elle ne contient qu'un `STATUS.md` de
+  diagnostic et n'a aucun lien avec `main`. Le push étant fait avec le
+  `GITHUB_TOKEN`, il ne redéclenche aucun workflow (pas de boucle).
+  Le job appelle ensuite `actions/workflows/<file>/enable`; c'est une simple
+  ceinture de sécurité — un workflow déjà désactivé ne peut pas se réactiver
+  lui‑même, il faut alors le réactiver depuis l'onglet Actions.
 
 ## Dépannage
 - Erreur `Unauthorized: invalid api-id/api-hash` → vérifier que vous utilisez bien les identifiants issus de https://my.telegram.org et non BotFather [1,2].
